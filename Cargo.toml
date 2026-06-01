@@ -1,0 +1,23 @@
+[package]
+name = "zellij-tab-jump"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pin-and-jump for Zellij tabs. Pin 2-4 tabs and switch with single-letter hotkeys."
+repository = "https://github.com/vxio/zellij-tab-jump"
+homepage = "https://github.com/vxio/zellij-tab-jump"
+authors = ["Vincent Xiao <vincentx72@gmail.com>"]
+readme = "README.md"
+keywords = ["zellij", "plugin", "tabs", "wasm", "tui"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+zellij-tile = "0.44"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+panic = "abort"
+strip = true
+lto = true
