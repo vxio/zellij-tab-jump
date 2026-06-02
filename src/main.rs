@@ -27,6 +27,12 @@ use serde::{Deserialize, Serialize};
 use zellij_tile::prelude::*;
 
 const DEFAULT_HOTKEYS: &str = "fdsajkl;";
+const DEFAULT_RECENT_HOTKEYS: &str = "123456789";
+
+/// Cap on how many tab names we remember in the MRU list per session.
+/// Larger than the default `recent_hotkeys` set so the section keeps
+/// some history beyond the keyboard-accessible slots.
+const MAX_RECENT: usize = 24;
 
 /// The wasi sandbox that zellij runs plugins in only exposes `/tmp`
 /// as writable. On macOS that resolves to the per-user
@@ -54,6 +60,12 @@ struct PersistedState {
     /// last closed. Restored when the picker reopens.
     #[serde(default)]
     last_selected: BTreeMap<String, String>,
+    /// session name → MRU list of tab names, most-recent first. Updated
+    /// on every focus change; capped at `MAX_RECENT`. The currently
+    /// focused tab is *not* in the list — only previously-focused tabs,
+    /// matching `previous_tab` semantics.
+    #[serde(default)]
+    recent_tabs: BTreeMap<String, Vec<String>>,
 }
 
 // ─── modes ────────────────────────────────────────────────────────────────
@@ -75,6 +87,10 @@ struct State {
 
     persisted: PersistedState,
     hotkeys: Vec<char>,
+    /// Hotkeys for jumping to MRU slots. Defaults to `123456789`.
+    /// Looked up *after* `hotkeys` so a key shared between the two
+    /// configs always jumps to the pinned slot, never the MRU one.
+    recent_hotkeys: Vec<char>,
     /// When false (the default), the `pin-current` pipe skips the desktop
     /// notification call. Enabled by setting the plugin arg
     /// `notifications = "on"` in `config.kdl`.
@@ -119,6 +135,15 @@ impl ZellijPlugin for State {
         self.hotkeys = dedupe_hotkeys(raw);
         if self.hotkeys.is_empty() {
             self.hotkeys = DEFAULT_HOTKEYS.chars().collect();
+        }
+
+        let raw_recent = cfg
+            .get("recent_hotkeys")
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_RECENT_HOTKEYS);
+        self.recent_hotkeys = dedupe_hotkeys(raw_recent);
+        if self.recent_hotkeys.is_empty() {
+            self.recent_hotkeys = DEFAULT_RECENT_HOTKEYS.chars().collect();
         }
 
         self.notifications_enabled = cfg
@@ -212,7 +237,7 @@ impl ZellijPlugin for State {
             // `is_visible` here it still reflects the state *before* the
             // binding fired.
             "toggle" if self.is_visible => {
-                hide_self();
+                self.dismiss();
             }
             _ => {}
         }
@@ -231,7 +256,7 @@ impl ZellijPlugin for State {
         self.draw(rows, cols);
         if self.pending_close {
             self.pending_close = false;
-            hide_self();
+            self.dismiss();
         }
     }
 }
@@ -255,7 +280,11 @@ impl State {
         };
         if let (Some(old), Some(session)) = (focus_change, self.current_session.clone()) {
             self.mutate_state(|s| {
-                s.previous_tab.insert(session, old);
+                s.previous_tab.insert(session.clone(), old.clone());
+                let list = s.recent_tabs.entry(session).or_default();
+                list.retain(|n| n != &old);
+                list.insert(0, old);
+                list.truncate(MAX_RECENT);
             });
         }
         self.current_tab_name = new_focus;
@@ -505,31 +534,147 @@ fn dedupe_hotkeys(raw: &str) -> Vec<char> {
 
 // ─── view helpers ─────────────────────────────────────────────────────────
 
+/// Which conceptual block a tab belongs to in the picker. Drives both the
+/// separator line drawn between the two blocks and the hotkey label
+/// rendered for each row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Section {
+    /// Pinned to a slot letter from `hotkeys`.
+    Pinned,
+    /// Everything not pinned — MRU-tracked tabs first (gets a number from
+    /// `recent_hotkeys`), then never-visited tabs by position, then the
+    /// currently focused tab last (no hotkey).
+    Recent,
+}
+
+/// Hotkey label rendered next to a Recent row. Slot 0 is always reserved
+/// for `Tab`; later slots use single characters from `recent_hotkeys`.
+#[derive(Clone, Copy)]
+enum RecentHotkeyLabel {
+    Tab,
+    Char(char),
+}
+
+impl RecentHotkeyLabel {
+    fn render(self) -> String {
+        match self {
+            RecentHotkeyLabel::Tab => "tab".to_string(),
+            RecentHotkeyLabel::Char(c) => c.to_string(),
+        }
+    }
+}
+
 impl State {
-    /// All tabs in display order: pinned first (sorted by slot), then unpinned
-    /// (in tab position order).
-    fn visible_tabs(&self) -> Vec<&TabInfo> {
+    fn recent_for_session(&self) -> Option<&Vec<String>> {
+        self.persisted
+            .recent_tabs
+            .get(self.current_session.as_ref()?)
+    }
+
+    /// Tabs from the MRU list that are still alive and not pinned, in
+    /// MRU order. The currently-focused tab is excluded — it never ends
+    /// up in `recent_tabs` because we only push the *previous* focus on
+    /// a focus change, but we also defensively skip `t.active` here in
+    /// case a startup race leaves the active tab on the list.
+    fn recent_targets(&self) -> Vec<&TabInfo> {
+        let Some(list) = self.recent_for_session() else {
+            return Vec::new();
+        };
+        let pins = self.session_pins();
+        let mut out = Vec::new();
+        for name in list {
+            if pins.is_some_and(|p| p.contains_key(name)) {
+                continue;
+            }
+            if let Some(t) = self.tabs.iter().find(|t| &t.name == name) {
+                if t.active {
+                    continue;
+                }
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    fn recent_slot_for_tab(&self, name: &str) -> Option<usize> {
+        self.recent_targets().iter().position(|t| t.name == name)
+    }
+
+    /// Hotkey label for a recent slot. Slot 0 is the `Tab`-keyed slot;
+    /// slots 1.. consume `recent_hotkeys` in order (so the default digit
+    /// hotkeys are `1`→slot 1, `2`→slot 2, …).
+    fn recent_hotkey_label_for_slot(&self, slot: usize) -> Option<RecentHotkeyLabel> {
+        if slot == 0 {
+            return Some(RecentHotkeyLabel::Tab);
+        }
+        self.recent_hotkeys
+            .get(slot - 1)
+            .copied()
+            .map(RecentHotkeyLabel::Char)
+    }
+
+    fn slot_for_recent_hotkey(&self, c: char) -> Option<usize> {
+        self.recent_hotkeys
+            .iter()
+            .position(|&k| k == c)
+            .map(|i| i + 1)
+    }
+
+    fn tab_for_recent_slot(&self, slot: usize) -> Option<String> {
+        self.recent_targets().get(slot).map(|t| t.name.clone())
+    }
+
+    /// All tabs in display order, tagged with their section. Pinned slot
+    /// order first, then a single Recent block: MRU-tracked tabs (in MRU
+    /// order), then never-visited unpinned tabs by tab position, then the
+    /// currently focused tab last.
+    fn sectioned_tabs(&self) -> Vec<(Section, &TabInfo)> {
         let pins = self.session_pins();
         let mut pinned: Vec<&TabInfo> = Vec::new();
-        let mut unpinned: Vec<&TabInfo> = Vec::new();
         for t in &self.tabs {
             if pins.is_some_and(|p| p.contains_key(&t.name)) {
                 pinned.push(t);
-            } else {
-                unpinned.push(t);
             }
         }
         pinned.sort_by_key(|t| {
             pins.and_then(|p| p.get(&t.name).copied())
                 .unwrap_or(usize::MAX)
         });
-        unpinned.sort_by_key(|t| t.position);
-        pinned.extend(unpinned);
-        pinned
+
+        let recent = self.recent_targets();
+        let in_recent: BTreeSet<&str> = recent.iter().map(|t| t.name.as_str()).collect();
+
+        let mut never_visited: Vec<&TabInfo> = Vec::new();
+        let mut current: Option<&TabInfo> = None;
+        for t in &self.tabs {
+            let is_pinned = pins.is_some_and(|p| p.contains_key(&t.name));
+            if is_pinned || in_recent.contains(t.name.as_str()) {
+                continue;
+            }
+            if t.active {
+                current = Some(t);
+            } else {
+                never_visited.push(t);
+            }
+        }
+        never_visited.sort_by_key(|t| t.position);
+
+        let mut result: Vec<(Section, &TabInfo)> =
+            Vec::with_capacity(pinned.len() + recent.len() + never_visited.len() + 1);
+        result.extend(pinned.into_iter().map(|t| (Section::Pinned, t)));
+        result.extend(recent.into_iter().map(|t| (Section::Recent, t)));
+        result.extend(never_visited.into_iter().map(|t| (Section::Recent, t)));
+        if let Some(t) = current {
+            result.push((Section::Recent, t));
+        }
+        result
     }
 
-    /// Filtered list (search-aware). Both pinned and unpinned participate in
-    /// the filter.
+    fn visible_tabs(&self) -> Vec<&TabInfo> {
+        self.sectioned_tabs().into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// Filtered list (search-aware). All sections participate in the filter.
     fn filtered_tabs(&self) -> Vec<&TabInfo> {
         let v = self.visible_tabs();
         if self.mode != Mode::Search || self.search_term.is_empty() {
@@ -624,7 +769,7 @@ impl State {
     fn handle_normal_key(&mut self, key: KeyWithModifier) -> bool {
         if key.has_modifiers(&[KeyModifier::Ctrl]) {
             if let BareKey::Char('c') = key.bare_key {
-                hide_self();
+                self.dismiss();
                 return false;
             }
             return false;
@@ -640,7 +785,7 @@ impl State {
                 true
             }
             BareKey::Tab => {
-                self.jump_to_previous();
+                self.jump_to_recent_slot(0, '\t');
                 true
             }
             BareKey::Down => {
@@ -656,7 +801,7 @@ impl State {
                 true
             }
             BareKey::Esc => {
-                hide_self();
+                self.dismiss();
                 false
             }
             BareKey::Char(' ') | BareKey::Char('g') => {
@@ -666,6 +811,9 @@ impl State {
             BareKey::Char(c) => {
                 if let Some(slot) = self.slot_for_hotkey(c) {
                     self.jump_to_slot(slot, c);
+                    true
+                } else if let Some(slot) = self.slot_for_recent_hotkey(c) {
+                    self.jump_to_recent_slot(slot, c);
                     true
                 } else {
                     false
@@ -683,7 +831,7 @@ impl State {
                 return true;
             }
             if key.bare_key == BareKey::Char('c') {
-                hide_self();
+                self.dismiss();
                 return false;
             }
             return false;
@@ -728,9 +876,22 @@ impl State {
 // ─── actions ──────────────────────────────────────────────────────────────
 
 impl State {
+    /// Tear down the floating picker pane. Replaces `hide_self()` because
+    /// zellij re-focuses suppressed plugin panes on whatever tab they were
+    /// last attached to — re-opening via `LaunchOrFocusPlugin` would warp
+    /// the user back to that tab even with `move_to_focused_tab true`.
+    /// `close_self()` removes the pane outright so the next launch creates
+    /// a fresh one on the user's current tab. We persist selection state
+    /// up front because `Visible(false)` may not fire before the WASM
+    /// instance is torn down.
+    fn dismiss(&mut self) {
+        self.record_selection();
+        close_self();
+    }
+
     fn jump_to_tab(&mut self, name: &str) {
         if self.current_tab_name.as_deref() == Some(name) {
-            hide_self();
+            self.dismiss();
             return;
         }
         // Record the focus change synchronously: zellij doesn't deliver
@@ -768,18 +929,16 @@ impl State {
         }
     }
 
-    fn jump_to_previous(&mut self) {
-        let Some(session) = self.current_session.as_ref() else {
-            self.set_error("no current session".into());
-            return;
+    fn jump_to_recent_slot(&mut self, slot: usize, hotkey: char) {
+        let label = if slot == 0 {
+            "tab".to_string()
+        } else {
+            format!("'{}'", hotkey)
         };
-        if let Some(prev) = self.persisted.previous_tab.get(session).cloned() {
-            if self.tabs.iter().any(|t| t.name == prev) {
-                self.jump_to_tab(&prev);
-                return;
-            }
+        match self.tab_for_recent_slot(slot) {
+            Some(name) => self.jump_to_tab(&name),
+            None => self.set_error(format!("no recent tab at {label}")),
         }
-        self.set_error("no previous tab".into());
     }
 
     fn toggle_pin_selected(&mut self) {
@@ -808,18 +967,41 @@ impl State {
         self.clamp_selection();
         let mut lines: Vec<String> = Vec::with_capacity(rows);
 
-        let visible = self.filtered_tabs();
-        // Show pinned tabs that are actually present in the current tab
-        // list; stale pins for renamed/closed tabs aren't counted.
+        // Build a section-tagged view of the filtered tab list. In normal
+        // mode this is just `sectioned_tabs`; in search mode we keep the
+        // section tags so hotkey labels still render, but skip the
+        // between-section separator lines because the filter can hide
+        // whole sections.
+        let sectioned = self.sectioned_tabs();
+        let section_by_name: BTreeMap<&str, Section> = sectioned
+            .iter()
+            .map(|(s, t)| (t.name.as_str(), *s))
+            .collect();
+        let filtered = self.filtered_tabs();
+        let visible: Vec<(Section, &TabInfo)> = filtered
+            .iter()
+            .map(|t| {
+                let section = section_by_name
+                    .get(t.name.as_str())
+                    .copied()
+                    .unwrap_or(Section::Recent);
+                (section, *t)
+            })
+            .collect();
+
         let live_pin_count = visible
             .iter()
-            .filter(|t| self.slot_for_tab(&t.name).is_some())
+            .filter(|(s, _)| *s == Section::Pinned)
+            .count();
+        let recent_count = visible
+            .iter()
+            .filter(|(s, _)| *s == Section::Recent)
             .count();
 
         let session = self.current_session.as_deref().unwrap_or("<no session>");
         let tab_count = self.tabs.len();
         lines.push(format!(
-            " {CSI}1;36mTabs ({tab_count}){CSI}0m  {CSI}90m· {live_pin_count} pinned  · session: {CSI}33m{session}{CSI}0m"
+            " {CSI}1;36mTabs ({tab_count}){CSI}0m  {CSI}90m· {live_pin_count} pinned · {recent_count} recent · session: {CSI}33m{session}{CSI}0m"
         ));
 
         if let Some(toast) = self.pin_toast.as_deref() {
@@ -836,33 +1018,41 @@ impl State {
         if visible.is_empty() {
             lines.push(format!(" {CSI}90m(no tabs){CSI}0m"));
         }
-        let last_tab_name = self
-            .current_session
-            .as_ref()
-            .and_then(|s| self.persisted.previous_tab.get(s).cloned());
-        let mut separator_shown = false;
-        for (i, t) in visible.iter().enumerate() {
-            let slot = self.slot_for_tab(&t.name);
-            let is_pinned = slot.is_some();
-
-            if !is_pinned && !separator_shown && live_pin_count > 0 && i > 0 {
-                lines.push(format!(" {CSI}90m─── unpinned ───{CSI}0m"));
-                separator_shown = true;
+        let show_separators = self.mode == Mode::Normal;
+        let mut prev_section: Option<Section> = None;
+        for (i, (section, t)) in visible.iter().enumerate() {
+            if show_separators && prev_section.is_some_and(|p| p != *section) {
+                let label = match section {
+                    Section::Recent => "recent",
+                    Section::Pinned => "pinned",
+                };
+                lines.push(format!(" {CSI}90m─── {label} ───{CSI}0m"));
             }
+            prev_section = Some(*section);
 
-            let hotkey_str = match slot.and_then(|s| self.hotkey_for_slot(s)) {
-                Some(c) => {
-                    let color = if t.active { "90" } else { "36" };
-                    format!("{CSI}{color}m[{c}]{CSI}0m")
+            let hotkey_str = match section {
+                Section::Pinned => {
+                    let slot = self.slot_for_tab(&t.name);
+                    match slot.and_then(|s| self.hotkey_for_slot(s)) {
+                        Some(c) => {
+                            let color = if t.active { "90" } else { "36" };
+                            format!("{CSI}{color}m[{c}]{CSI}0m")
+                        }
+                        None => format!("{CSI}90m · {CSI}0m"),
+                    }
                 }
-                None => format!("{CSI}90m · {CSI}0m"),
+                Section::Recent => {
+                    let slot = self.recent_slot_for_tab(&t.name);
+                    match slot.and_then(|s| self.recent_hotkey_label_for_slot(s)) {
+                        Some(label) => format!("{CSI}35m[{}]{CSI}0m", label.render()),
+                        None => format!("{CSI}90m · {CSI}0m"),
+                    }
+                }
             };
             let is_selected = i == self.selected_index;
             let marker = if is_selected { "▶" } else { " " };
             let current_str = if t.active {
                 format!("  {CSI}33m(current){CSI}0m")
-            } else if last_tab_name.as_deref() == Some(t.name.as_str()) {
-                format!("  {CSI}35m(last tab){CSI}0m")
             } else {
                 String::new()
             };

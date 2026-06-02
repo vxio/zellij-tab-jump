@@ -14,15 +14,21 @@ few tabs to `f` / `d` / `s` / `a`, and jump with one keystroke.
 
 - **Pin** any tab to a single-letter slot. Slots are `fdsajkl;` by default
   (configurable).
-- **Floating picker** showing pinned tabs first (with their hotkey letter)
-  and unpinned tabs below.
+- **Recent tabs (MRU)**: tabs you've focused recently are listed below
+  the pinned section in most-recent-first order. The most-recent slot
+  is labeled `[tab]` and jumps with the `Tab` key; the next slots get
+  numeric hotkeys (`1`–`9` by default; configurable) so you can jump
+  to any of the last few without first pinning them.
+- **Floating picker** showing pinned tabs first, then everything else
+  in the recent section.
 - **Toggle**: one key opens the picker; pressing it again hides it.
 - **Quick-pin from anywhere**: a second key pins the focused tab without
   opening the picker. Idempotent — re-firing on an already-pinned tab
   just reconfirms the slot, never toggles off. Optional desktop
   notification (off by default; macOS `osascript` / Linux `notify-send`)
   confirms the assigned slot.
-- **`Tab`** in the picker toggles to the previously-focused tab.
+- **`Tab`** in the picker jumps to the top of the recent section (the
+  most-recently-focused unpinned tab — `[tab]` label).
 - **`/`** fuzzy-search filter across all tabs.
 - **Persistent** across zellij restarts. State lives in
   `/tmp/zellij-tab-jump-state.json` (which on macOS resolves to the
@@ -172,12 +178,16 @@ The rest of the docs use **toggle key** and **quick-pin key** to mean
 
 | Key | Action |
 |---|---|
-| configured hotkey letter (default `f` `d` `s` `a` `j` `k` `l` `;`) | jump to the pinned slot |
-| `Tab` | toggle to the previously-focused tab |
+| configured pin hotkey (default `f` `d` `s` `a` `j` `k` `l` `;`) | jump to the pinned slot |
+| `Tab` | jump to the most-recently-focused unpinned tab (`[tab]` label, top of the Recent section) |
+| configured recent hotkey (default `1`–`9`) | jump to the 2nd, 3rd, … most-recently-focused unpinned tab |
 | `↑` / `↓` + `Enter` | jump to highlighted tab |
 | `/` | start fuzzy search; type to filter |
 | `g` or `Space` | pin / unpin the highlighted tab |
 | `Esc` or `Ctrl-c` | close |
+
+If a key appears in both `hotkeys` and `recent_hotkeys`, the pinned
+slot wins.
 
 ## Notifications
 
@@ -207,6 +217,7 @@ quick-pin bindings reuse — so this is the single source of truth.
 load_plugins {
     "file:~/.config/zellij/plugins/tab-jump.wasm" {
         hotkeys "fdsajkl;"
+        recent_hotkeys "123456789"
         notifications "off"
     }
 }
@@ -214,7 +225,8 @@ load_plugins {
 
 | key | default | description |
 |---|---|---|
-| `hotkeys` | `fdsajkl;` | Ordered list of single-char slot letters. Whitespace and duplicate characters are stripped. The number of pin slots equals `len(hotkeys)`; attempting to pin past that fails with an error in the picker. Unpinned tabs are always reachable via arrows or search. |
+| `hotkeys` | `fdsajkl;` | Ordered list of single-char slot letters for **pinned** tabs. Whitespace and duplicate characters are stripped. The number of pin slots equals `len(hotkeys)`; attempting to pin past that fails with an error in the picker. Unpinned tabs are always reachable via the recent section, arrows, or search. |
+| `recent_hotkeys` | `123456789` | Ordered list of single-char hotkeys for the **Recent** (MRU) section, starting at the *2nd* entry — the 1st (most-recent) entry is always labeled `[tab]` and bound to the `Tab` key. The first `len(recent_hotkeys) + 1` entries of the MRU list get keyboard labels. If a key appears in both `hotkeys` and `recent_hotkeys`, the pinned slot wins. |
 | `notifications` | `off` | Set to `on` (or `true` / `1` / `yes`) to enable the quick-pin desktop notification. Any other value (or omitting) leaves it off. |
 
 ### How many pins can I have?
@@ -237,27 +249,45 @@ load_plugins {
 
 ## How it works
 
-`load_plugins` preloads a single plugin instance at startup. Both
-bindings target *that* instance via pipe messages, so there's only
-ever one process holding state:
+Two plugin instances run side by side, sharing state on disk:
+
+- A **preloaded background instance** (from `load_plugins`) holds the
+  `pin-current` pipe handler and the optional notifier. It never
+  becomes a visible pane.
+- A **floating picker instance** is launched by `LaunchOrFocusPlugin`
+  on the toggle key and **torn down via `close_self()`** on every
+  dismiss (Esc, jump, second toggle-key press). The next toggle press
+  launches a fresh pane on the user's current tab.
 
 ```diagram
-╭───────────────╮  pipe "toggle"      ╭──────────────────╮     ╭──────────────╮
-│ toggle key    │ ──────────────────▶ │                  │ ──▶ │ state.json   │
-╰───────────────╯                     │  tab-jump        │     ╰──────────────╯
-                                      │  (one preloaded  │
-╭───────────────╮  pipe "pin-current" │   instance)      │     ╭──────────────╮
-│ quick-pin key │ ──────────────────▶ │                  │ ──▶ │ osascript /  │
-╰───────────────╯                     ╰──────────────────╯     │ notify-send  │
-                                                               │ (optional)   │
-                                                               ╰──────────────╯
+                                        ╭──────────────────╮
+╭───────────────╮  pipe "toggle"        │ floating picker  │     ╭──────────────╮
+│ toggle key    │ ────────────────────▶ │ (re-launched per │ ──▶ │ state.json   │
+│ + Launch…     │                       │  toggle press;   │     ╰──────────────╯
+╰───────────────╯                       │  close_self on   │             ▲
+                                        │  dismiss)        │             │
+                                        ╰──────────────────╯             │
+                                        ╭──────────────────╮             │
+╭───────────────╮  pipe "pin-current"   │ preloaded        │ ────────────╯
+│ quick-pin key │ ────────────────────▶ │ background       │     ╭──────────────╮
+╰───────────────╯                       │ (notifier host)  │ ──▶ │ osascript /  │
+                                        ╰──────────────────╯     │ notify-send  │
+                                                                 │ (optional)   │
+                                                                 ╰──────────────╯
 ```
+
+**Why `close_self` instead of `hide_self`?** Zellij remembers a
+suppressed plugin pane's tab and re-focuses it on that tab next time
+`LaunchOrFocusPlugin` fires — even with `move_to_focused_tab true`. So
+`hide_self` made `Alt-d` → `Esc` → `Alt-d` warp the user back to
+wherever the picker was first opened. Closing the pane outright avoids
+the warp at the cost of a fresh plugin load each time the picker
+appears (~tens of ms).
 
 State lives in `/tmp/zellij-tab-jump-state.json`. Every mutation
 re-reads the file, applies the change, and writes it back via a temp +
-rename, so a crash mid-write can't leave a truncated file and any
-sibling plugin instance (e.g. from a stray `LaunchPlugin`) can't
-overwrite recent pins.
+rename, so a crash mid-write can't leave a truncated file and the two
+instances can't overwrite each other's pins.
 
 The path is deliberately under `/tmp`: zellij's wasi sandbox only
 exposes `/tmp` as writable, so XDG paths under `$HOME` aren't reachable
@@ -270,26 +300,45 @@ machine would share one file.
 
 The quick-pin key is wired as a `MessagePlugin` pipe (not
 `LaunchOrFocusPlugin`) so the picker never pops; the preloaded
-instance handles it silently and triggers the host notifier.
+background instance handles it silently and triggers the host
+notifier.
 
 ## Development
 
+Common tasks are wrapped in a [`justfile`](./justfile). Install
+[`just`](https://github.com/casey/just) (`brew install just` /
+`cargo install just`) and then:
+
 ```sh
-# Build the wasm artifact
-cargo build --release
-
-# Install into your local zellij plugin dir
-cp target/wasm32-wasip1/release/zellij-tab-jump.wasm \
-   ~/.config/zellij/plugins/tab-jump.wasm
-
-# Hot-reload an already-running instance (no zellij restart needed)
-zellij action start-or-reload-plugin \
-   file:~/.config/zellij/plugins/tab-jump.wasm
+just              # list recipes
+just build        # cargo build --release
+just dev          # build → install into ~/.config/zellij/plugins → hot-reload
+just check        # fmt --check + clippy -D warnings + build (same as CI)
+just fix          # auto-fix fmt + clippy
+just watch        # rerun `just dev` on src/ changes (needs cargo-watch)
+just install-hooks  # enable repo-tracked pre-commit hook (runs `just check`)
 ```
+
+The typical inner loop is: edit `src/main.rs`, run `just dev`, switch
+to zellij — the picker instance is rebuilt on the next toggle keypress
+because it's closed-and-relaunched per-use. The **preloaded background
+instance** (which handles `pin-current`) only swaps in on session
+restart, so reload it by detaching (`Ctrl-o d`) and reattaching
+(`zellij a <session>`) when you've touched code on the quick-pin path.
 
 The crate is single-file (`src/main.rs`, ~850 lines). The `[build]`
 target in `.cargo/config.toml` defaults to `wasm32-wasip1` so a plain
 `cargo build` produces the wasm artifact.
+
+If you'd rather not use `just`, the raw commands are:
+
+```sh
+cargo build --release
+cp target/wasm32-wasip1/release/zellij-tab-jump.wasm \
+   ~/.config/zellij/plugins/tab-jump.wasm
+zellij action start-or-reload-plugin \
+   file:~/.config/zellij/plugins/tab-jump.wasm
+```
 
 ## Design notes
 

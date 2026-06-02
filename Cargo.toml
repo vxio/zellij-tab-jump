@@ -1,6 +1,6 @@
 [package]
 name = "zellij-tab-jump"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 description = "Pin-and-jump for Zellij tabs. Pin 2-4 tabs and switch with single-letter hotkeys."
