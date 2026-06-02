@@ -126,6 +126,31 @@ load_plugins {
 | `hotkeys` | `fdsajkl;` | Ordered list of single-char slot letters. Whitespace ignored. Tabs beyond `len(hotkeys)` can still be reached via arrows or search, just without a single-letter shortcut. |
 | `notifications` | `on` | Set to `off` (or `false` / `0` / `no`) to suppress the `Alt-Shift-d` desktop notification. The pin itself still happens. |
 
+### How many pins can I have?
+
+Whatever fits in `hotkeys`. There's no internal cap — pin count is just
+`len(hotkeys)`. The default is 8 because eight home-row letters are the
+sweet spot for muscle memory, but you can scale up to ~20+ with the top
+and bottom rows. Any printable character works except those reserved by
+the picker (`g` = pin, `/` = search, `Space`, `Tab`, `Enter`, `Esc`,
+arrows, `Ctrl-c`).
+
+A ~16-slot home + top-row config:
+
+```kdl
+load_plugins {
+    "file:~/.config/zellij/plugins/tab-jump.wasm" {
+        hotkeys "fdsajkl;weruioqp"
+    }
+}
+```
+
+A ~22-slot maximalist config (you won't remember which tab is `,` vs `.`):
+
+```kdl
+hotkeys "fdsajkl;weruioqpcvbnm,.tyz"
+```
+
 ## How it works
 
 Two binding paths share one preloaded plugin instance:
