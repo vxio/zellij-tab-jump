@@ -26,7 +26,53 @@ few tabs to `f` / `d` / `s` / `a`, and jump with one keystroke.
 
 ## Install
 
-Prerequisites: Rust toolchain with the `wasm32-wasip1` target installed
+### Option 1 — Zellij URL loading (recommended)
+
+Zellij can fetch a remote `.wasm` and cache it. No Rust toolchain
+needed; nothing to download manually. Reference the release URL
+directly in your bindings:
+
+```kdl
+shared_except "locked" {
+    bind "Alt d" {
+        LaunchOrFocusPlugin "https://github.com/vxio/zellij-tab-jump/releases/latest/download/tab-jump.wasm" {
+            floating true
+            move_to_focused_tab true
+        }
+        MessagePlugin "https://github.com/vxio/zellij-tab-jump/releases/latest/download/tab-jump.wasm" {
+            name "toggle"
+        }
+    }
+}
+
+load_plugins {
+    "https://github.com/vxio/zellij-tab-jump/releases/latest/download/tab-jump.wasm"
+}
+```
+
+Zellij downloads the wasm on first run and caches it under
+`~/.cache/zellij/plugins/`. Updates are pulled when you bump the URL
+to a pinned tag (e.g. `…/download/v0.2.0/tab-jump.wasm`).
+
+### Option 2 — Download prebuilt wasm
+
+If you'd rather keep the file local:
+
+```sh
+mkdir -p ~/.config/zellij/plugins
+curl -L \
+  https://github.com/vxio/zellij-tab-jump/releases/latest/download/tab-jump.wasm \
+  -o ~/.config/zellij/plugins/tab-jump.wasm
+```
+
+Then use `file:~/.config/zellij/plugins/tab-jump.wasm` in your kdl
+config (see [Keybindings](#keybindings)).
+
+### Option 3 — Build from source
+
+For local development or platforms where the prebuilt artifact won't do.
+
+Prerequisites: Rust toolchain with the `wasm32-wasip1` target
 (`rustup target add wasm32-wasip1`).
 
 ```sh
