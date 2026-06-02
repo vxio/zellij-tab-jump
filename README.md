@@ -146,12 +146,6 @@ load_plugins {
 }
 ```
 
-A ~22-slot maximalist config (you won't remember which tab is `,` vs `.`):
-
-```kdl
-hotkeys "fdsajkl;weruioqpcvbnm,.tyz"
-```
-
 ## How it works
 
 Two binding paths share one preloaded plugin instance:
