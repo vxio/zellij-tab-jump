@@ -32,23 +32,35 @@ cp target/wasm32-wasip1/release/zellij-tab-jump.wasm \
 
 ## Keybindings
 
-Add to `~/.config/zellij/config.kdl`:
+The plugin exposes two **pipe message names** — `toggle` and
+`pin-current` — and lets you bind them to whatever keys you want in
+`~/.config/zellij/config.kdl`. There are no hard-coded shortcuts.
+
+| Pipe message | What it does | Suggested bind |
+|---|---|---|
+| `toggle` | Show the picker if hidden, hide it if visible. Pair with `LaunchOrFocusPlugin` so the same key both opens and closes. | `Alt d` |
+| `pin-current` | Pin the currently focused tab and fire a desktop notification. Idempotent — never unpins. | `Alt Shift d` |
+
+Drop this block into `config.kdl` and swap the `bind` keys to taste
+(e.g. `Ctrl t` / `Ctrl Shift t`, `Alt o` / `Alt Shift o`, …):
 
 ```kdl
 shared_except "locked" {
-    // Toggle the picker: opens if hidden, hides if visible.
+    // === Open / toggle the picker. Change "Alt d" to any key. ===
     bind "Alt d" {
         LaunchOrFocusPlugin "file:~/.config/zellij/plugins/tab-jump.wasm" {
             floating true
             move_to_focused_tab true
-            // Optional override:
+            // Optional plugin config:
             // hotkeys "fdsajkl;"
+            // notifications "on"
         }
         MessagePlugin "file:~/.config/zellij/plugins/tab-jump.wasm" {
             name "toggle"
         }
     }
-    // Pin the currently focused tab and fire a desktop notification.
+
+    // === Quick-pin the focused tab. Change "Alt D" to any key. ===
     bind "Alt D" {
         MessagePlugin "file:~/.config/zellij/plugins/tab-jump.wasm" {
             name "pin-current"
@@ -56,8 +68,8 @@ shared_except "locked" {
     }
 }
 
-// Preload so the Alt-Shift-d pipe always reaches an instance — the picker
-// stays suppressed until Alt-d opens it.
+// Preload so the quick-pin binding always reaches an instance — the
+// picker stays suppressed until the toggle key opens it.
 load_plugins {
     "file:~/.config/zellij/plugins/tab-jump.wasm"
 }
@@ -66,6 +78,9 @@ load_plugins {
 Required permissions: `ReadApplicationState`, `ChangeApplicationState`,
 `RunCommands` (for the notification shell-out). The plugin requests them
 on first load.
+
+> Throughout the rest of the docs, `Alt-d` and `Alt-Shift-d` refer to
+> *whichever* keys you bound to `toggle` and `pin-current`.
 
 ## Picker keys
 

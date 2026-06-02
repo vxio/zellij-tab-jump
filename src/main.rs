@@ -2,13 +2,13 @@
 //!
 //! Pin-and-jump for Zellij tabs.
 //!
-//! * Floating picker bound to a keybinding (default suggestion: `Alt d`).
-//!   Re-pressing the bind toggles the picker hidden — pair the
-//!   `LaunchOrFocusPlugin` action with a `MessagePlugin { name "toggle" }`
-//!   to get that behavior.
-//! * Pin the focused tab from anywhere via a `pin-current` pipe message
-//!   bound to a global key (default suggestion: `Alt Shift d`). Idempotent:
-//!   re-firing on an already-pinned tab just reconfirms the slot.
+//! Two pipe-message entry points — bind them to whatever zellij keys
+//! you like in `config.kdl`:
+//!
+//! * `toggle` — show the floating picker if hidden, hide it if visible.
+//!   Pair with `LaunchOrFocusPlugin` so the same key opens and closes.
+//! * `pin-current` — pin the focused tab. Idempotent: re-firing on an
+//!   already-pinned tab just reconfirms the slot, never toggles off.
 //! * Pin/unpin inside the picker with `g` on the selected row.
 //! * Pinned tabs claim a slot letter from the configured `hotkeys` set
 //!   (default `fdsajkl;`); pressing the letter in the picker jumps there.
