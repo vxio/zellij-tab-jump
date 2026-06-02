@@ -2,7 +2,8 @@
 
 Pin-and-jump for [Zellij](https://zellij.dev) tabs.
 
-Pin 2–4 tabs to home-row letters. Hit `Alt-d` then `f` / `d` / `s` / `a` to jump.
+Pin tabs to any keys. For example, bind the picker to `Alt-d`, pin a
+few tabs to `f` / `d` / `s` / `a`, and jump with one keystroke.
 
 ## Features
 
@@ -10,8 +11,8 @@ Pin 2–4 tabs to home-row letters. Hit `Alt-d` then `f` / `d` / `s` / `a` to ju
   (configurable).
 - **Floating picker** showing pinned tabs first (with their hotkey letter)
   and unpinned tabs below.
-- **Toggle**: `Alt-d` opens the picker; pressing it again hides it.
-- **Quick-pin from anywhere**: `Alt-Shift-d` pins the focused tab without
+- **Toggle**: one key opens the picker; pressing it again hides it.
+- **Quick-pin from anywhere**: a second key pins the focused tab without
   opening the picker. A desktop notification (macOS `osascript` /
   Linux `notify-send`) confirms the assigned slot. Idempotent — re-firing
   on an already-pinned tab just reconfirms the slot, never toggles off.
@@ -79,8 +80,8 @@ Required permissions: `ReadApplicationState`, `ChangeApplicationState`,
 `RunCommands` (for the notification shell-out). The plugin requests them
 on first load.
 
-> Throughout the rest of the docs, `Alt-d` and `Alt-Shift-d` refer to
-> *whichever* keys you bound to `toggle` and `pin-current`.
+The rest of the docs use **toggle key** and **quick-pin key** to mean
+"whatever you bound to the `toggle` and `pin-current` pipe messages."
 
 ## Picker keys
 
@@ -95,7 +96,7 @@ on first load.
 
 ## Notifications
 
-`Alt-Shift-d` emits a desktop notification confirming the slot
+The quick-pin key emits a desktop notification confirming the slot
 (e.g. `tab-jump: pinned [f] → 3) zed@main`). The plugin probes for
 `osascript` (macOS) first and falls back to `notify-send` (Linux); on
 hosts with neither, the pin still succeeds but no toast appears.
@@ -124,7 +125,7 @@ load_plugins {
 | key | default | description |
 |---|---|---|
 | `hotkeys` | `fdsajkl;` | Ordered list of single-char slot letters. Whitespace ignored. Tabs beyond `len(hotkeys)` can still be reached via arrows or search, just without a single-letter shortcut. |
-| `notifications` | `on` | Set to `off` (or `false` / `0` / `no`) to suppress the `Alt-Shift-d` desktop notification. The pin itself still happens. |
+| `notifications` | `on` | Set to `off` (or `false` / `0` / `no`) to suppress the quick-pin desktop notification. The pin itself still happens. |
 
 ### How many pins can I have?
 
@@ -157,15 +158,15 @@ Two binding paths share one preloaded plugin instance:
 
 ```diagram
 ╭─────────────────╮   LaunchOrFocusPlugin   ╭──────────────────╮
-│ Alt-d           │ ──────────────────────▶ │ floating picker  │
+│ toggle key      │ ──────────────────────▶ │ floating picker  │
 │                 │   MessagePlugin toggle  │ (per-press show/ │
 │                 │ ──────────────────────▶ │  hide)           │
 ╰─────────────────╯                         ╰────────┬─────────╯
                                                      │ g / hotkey
                                                      ▼
 ╭─────────────────╮   MessagePlugin         ╭──────────────────╮
-│ Alt-Shift-d     │ ──────────────────────▶ │ preloaded bg     │
-│ (quick pin)     │      pin-current        │ instance         │
+│ quick-pin key   │ ──────────────────────▶ │ preloaded bg     │
+│                 │      pin-current        │ instance         │
 ╰─────────────────╯                         ╰────────┬─────────╯
                                                      │ run_command
                                                      ▼
@@ -180,7 +181,7 @@ shared by every running plugin instance for that session. Each mutation
 re-reads the file, applies the change, and writes it back — so the
 preloaded background instance and the visible picker can't race.
 
-`Alt-Shift-d` is wired as a `MessagePlugin` pipe (not
+The quick-pin key is wired as a `MessagePlugin` pipe (not
 `LaunchOrFocusPlugin`) so the picker never pops; the preloaded instance
 handles it silently and triggers the host notifier.
 

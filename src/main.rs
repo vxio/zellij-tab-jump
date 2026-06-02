@@ -69,8 +69,8 @@ struct State {
 
     persisted: PersistedState,
     hotkeys: Vec<char>,
-    /// When false, `Alt-Shift-d` skips the desktop notification call.
-    /// Configured via the `notifications` plugin arg in `config.kdl`.
+    /// When false, the `pin-current` pipe skips the desktop notification
+    /// call. Configured via the `notifications` plugin arg in `config.kdl`.
     notifications_enabled: bool,
 
     mode: Mode,
@@ -93,8 +93,8 @@ struct State {
     /// tab on every popup invocation.
     restored_selection: bool,
     /// True between `Visible(true)` and `Visible(false)`. Read by the
-    /// `toggle` pipe handler to decide whether `Alt-d` should hide the
-    /// picker (visible → hide) or fall through to the paired
+    /// `toggle` pipe handler to decide whether the toggle key should hide
+    /// the picker (visible → hide) or fall through to the paired
     /// `LaunchOrFocusPlugin` action (hidden → show).
     is_visible: bool,
     /// One-line banner shown at the top of the picker after the user pins
@@ -198,10 +198,11 @@ impl ZellijPlugin for State {
                     self.pending_pin_current = true;
                 }
             }
-            // Paired with `LaunchOrFocusPlugin` on Alt-d to give the binding
-            // toggle semantics. The kdl runs LaunchOrFocus first, then this
-            // pipe; events are queued, so when we read `is_visible` here it
-            // still reflects the state *before* the binding fired.
+            // Paired with `LaunchOrFocusPlugin` on the toggle key to give
+            // the binding toggle semantics. The kdl runs LaunchOrFocus
+            // first, then this pipe; events are queued, so when we read
+            // `is_visible` here it still reflects the state *before* the
+            // binding fired.
             "toggle" => {
                 if self.is_visible {
                     hide_self();
@@ -265,7 +266,7 @@ impl State {
     /// Synchronously fetch the current session's tabs from the server.
     /// Used by the pipe handler because zellij does not deliver `TabUpdate`
     /// to a hidden plugin pane — without this refresh, `current_tab_name`
-    /// can be stale when `Alt-Shift-d` fires.
+    /// can be stale when a `pin-current` pipe fires.
     fn refresh_from_server(&mut self) {
         let Ok(snapshot) = get_session_list() else { return };
         let Some(current) = snapshot
@@ -286,7 +287,7 @@ impl State {
     /// Read-modify-write the on-disk state. ALWAYS use this for any change
     /// that needs to persist — never mutate `self.persisted` and write
     /// separately. Multiple plugin instances run concurrently (picker +
-    /// per-press `Alt-Shift-d` workers); without reload-before-write they
+    /// per-press `pin-current` workers); without reload-before-write they
     /// stomp each other's pins. This reloads disk into `self.persisted`,
     /// applies the mutation, then writes the result back.
     fn mutate_state<F: FnOnce(&mut PersistedState)>(&mut self, f: F) {
@@ -364,8 +365,8 @@ impl State {
 
     /// Pin the focused tab if it isn't pinned yet. Idempotent: re-firing on
     /// an already-pinned tab just reports the existing slot rather than
-    /// unpinning. Used by `Alt-Shift-d` where the user's intent is "make
-    /// sure this is pinned", not "toggle".
+    /// unpinning. Used by the `pin-current` pipe where the user's intent is
+    /// "make sure this is pinned", not "toggle".
     fn pin_current_only(&mut self) -> Option<String> {
         let Some(name) = self.current_tab_name.clone() else {
             self.set_error("no focused tab".into());
@@ -399,7 +400,7 @@ impl State {
 
     /// Pin the focused tab and surface the result as a desktop notification.
     /// Inside the picker, `g` uses the in-pane toast instead — this path is
-    /// for the `Alt-Shift-d` pipe where we don't want to pop the picker.
+    /// for the `pin-current` pipe where we don't want to pop the picker.
     fn pin_current_and_notify(&mut self) {
         let Some(msg) = self.pin_current_only() else { return };
         if self.notifications_enabled {
