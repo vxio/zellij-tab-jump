@@ -36,10 +36,10 @@ The plugin exposes two **pipe message names** — `toggle` and
 `pin-current` — and lets you bind them to whatever keys you want in
 `~/.config/zellij/config.kdl`. There are no hard-coded shortcuts.
 
-| Pipe message | What it does | Suggested bind |
-|---|---|---|
-| `toggle` | Show the picker if hidden, hide it if visible. Pair with `LaunchOrFocusPlugin` so the same key both opens and closes. | `Alt d` |
-| `pin-current` | Pin the currently focused tab and fire a desktop notification. Idempotent — never unpins. | `Alt Shift d` |
+| Pipe message | What it does |
+|---|---|
+| `toggle` | Show the picker if hidden, hide it if visible. Pair with `LaunchOrFocusPlugin` so the same key both opens and closes. |
+| `pin-current` | Pin the currently focused tab and fire a desktop notification. Idempotent — never unpins. |
 
 Drop this block into `config.kdl` and swap the `bind` keys to taste
 (e.g. `Ctrl t` / `Ctrl Shift t`, `Alt o` / `Alt Shift o`, …):
