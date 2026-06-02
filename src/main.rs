@@ -19,16 +19,21 @@
 //!   `osascript` on macOS and `notify-send` on Linux; silent no-op on
 //!   hosts with neither.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 use zellij_tile::prelude::*;
 
-const STATE_PATH: &str = "/tmp/zellij-tab-jump-state.json";
 const DEFAULT_HOTKEYS: &str = "fdsajkl;";
-const ERROR_DECAY_TICKS: u8 = 6;
+
+/// The wasi sandbox that zellij runs plugins in only exposes `/tmp`
+/// as writable. On macOS that resolves to the per-user
+/// `$TMPDIR` (e.g. `/private/var/folders/<hash>/T/zellij-<uid>/`),
+/// so `/tmp` paths are already isolated per user. On Linux `/tmp`
+/// is the shared host tmp; the file is namespaced just by its name.
+const STATE_PATH: &str = "/tmp/zellij-tab-jump-state.json";
 
 // ─── persisted state ──────────────────────────────────────────────────────
 
@@ -78,22 +83,19 @@ struct State {
     mode: Mode,
     search_term: String,
     selected_index: usize,
+    /// Transient error banner; cleared on the next key press.
     error: Option<String>,
-    error_ticks_remaining: u8,
 
     /// True once a TabUpdate has populated `tabs` for the current session.
     /// Used to gate the `pending_pin_current` deferred action when the plugin
     /// is pipe-launched (the pipe message arrives before TabUpdate fires).
     tabs_loaded: bool,
     /// Set by a `pin-current` pipe message when tabs aren't loaded yet. The
-    /// next TabUpdate consumes it and performs the toggle.
+    /// next TabUpdate consumes it and performs the pin.
     pending_pin_current: bool,
     /// Whether to close the plugin pane after the next render. Set when we
     /// jump to a tab so the picker doesn't linger on screen.
     pending_close: bool,
-    /// Reset on each `Visible(true)` so the cursor re-snaps to the previous
-    /// tab on every popup invocation.
-    restored_selection: bool,
     /// True between `Visible(true)` and `Visible(false)`. Read by the
     /// `toggle` pipe handler to decide whether the toggle key should hide
     /// the picker (visible → hide) or fall through to the paired
@@ -114,7 +116,7 @@ impl ZellijPlugin for State {
             .get("hotkeys")
             .map(String::as_str)
             .unwrap_or(DEFAULT_HOTKEYS);
-        self.hotkeys = raw.chars().filter(|c| !c.is_whitespace()).collect();
+        self.hotkeys = dedupe_hotkeys(raw);
         if self.hotkeys.is_empty() {
             self.hotkeys = DEFAULT_HOTKEYS.chars().collect();
         }
@@ -124,11 +126,14 @@ impl ZellijPlugin for State {
             .map(|v| matches!(v.as_str(), "on" | "true" | "1" | "yes"))
             .unwrap_or(false);
 
-        request_permission(&[
+        let mut perms = vec![
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
-            PermissionType::RunCommands,
-        ]);
+        ];
+        if self.notifications_enabled {
+            perms.push(PermissionType::RunCommands);
+        }
+        request_permission(&perms);
         subscribe(&[
             EventType::TabUpdate,
             EventType::SessionUpdate,
@@ -153,7 +158,9 @@ impl ZellijPlugin for State {
                     .map(|s| s.name.clone());
                 if new_session != self.current_session {
                     self.current_session = new_session;
-                    self.restored_selection = false;
+                    self.tabs.clear();
+                    self.current_tab_name = None;
+                    self.tabs_loaded = false;
                 }
                 self.maybe_flush_pending_pin();
                 true
@@ -163,13 +170,12 @@ impl ZellijPlugin for State {
                 self.reload_state();
                 self.mode = Mode::Normal;
                 self.search_term.clear();
-                self.restored_selection = false;
                 self.restore_selection();
-                self.restored_selection = true;
                 true
             }
             Event::Visible(false) => {
                 self.is_visible = false;
+                self.record_selection();
                 false
             }
             Event::Timer(_) => {
@@ -205,10 +211,8 @@ impl ZellijPlugin for State {
             // first, then this pipe; events are queued, so when we read
             // `is_visible` here it still reflects the state *before* the
             // binding fired.
-            "toggle" => {
-                if self.is_visible {
-                    hide_self();
-                }
+            "toggle" if self.is_visible => {
+                hide_self();
             }
             _ => {}
         }
@@ -223,12 +227,6 @@ impl ZellijPlugin for State {
         // freshly-shown pane can race with the event delivery.
         if self.is_visible {
             self.reload_state();
-        }
-        if self.error.is_some() && self.error_ticks_remaining > 0 {
-            self.error_ticks_remaining -= 1;
-            if self.error_ticks_remaining == 0 {
-                self.error = None;
-            }
         }
         self.draw(rows, cols);
         if self.pending_close {
@@ -291,24 +289,36 @@ impl State {
     /// separately. Multiple plugin instances run concurrently (picker +
     /// per-press `pin-current` workers); without reload-before-write they
     /// stomp each other's pins. This reloads disk into `self.persisted`,
-    /// applies the mutation, then writes the result back.
+    /// applies the mutation, then writes the result back via a temp +
+    /// rename so a crash mid-write can't leave a truncated JSON file.
     fn mutate_state<F: FnOnce(&mut PersistedState)>(&mut self, f: F) {
         self.reload_state();
         f(&mut self.persisted);
-        if let Ok(s) = serde_json::to_string(&self.persisted) {
-            let _ = fs::write(STATE_PATH, s);
+        let Ok(raw) = serde_json::to_string(&self.persisted) else {
+            return;
+        };
+        let tmp = format!("{STATE_PATH}.tmp");
+        if fs::write(&tmp, raw).is_ok() {
+            let _ = fs::rename(&tmp, STATE_PATH);
         }
     }
 
     /// Re-read pins/previous-tab/last-selected from disk. Concurrent plugin
-    /// instances only share state through `STATE_PATH`, so anything that
-    /// depends on the latest pins must call this first.
+    /// instances only share state through the state file, so anything that
+    /// depends on the latest pins must call this first. A missing file is
+    /// treated as empty state; an unreadable / malformed file is left in
+    /// place and `self.persisted` keeps its current contents.
     fn reload_state(&mut self) {
-        let Ok(raw) = fs::read_to_string(STATE_PATH) else {
-            return;
-        };
-        if let Ok(p) = serde_json::from_str::<PersistedState>(&raw) {
-            self.persisted = p;
+        match fs::read_to_string(STATE_PATH) {
+            Ok(raw) => {
+                if let Ok(p) = serde_json::from_str::<PersistedState>(&raw) {
+                    self.persisted = p;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.persisted = PersistedState::default();
+            }
+            Err(_) => {}
         }
     }
 }
@@ -342,46 +352,76 @@ impl State {
             return None;
         };
         let hotkeys = self.hotkeys.clone();
-        let mut outcome: Option<String> = None;
         let name_owned = tab_name.to_string();
+        let mut outcome: Option<Result<String, String>> = None;
         self.mutate_state(|s| {
             let entry = s.pinned.entry(session).or_default();
             if entry.remove(&name_owned).is_some() {
-                outcome = Some(format!("unpinned: {}", name_owned));
+                outcome = Some(Ok(format!("unpinned: {}", name_owned)));
                 return;
             }
-            let used: std::collections::BTreeSet<usize> = entry.values().copied().collect();
-            let mut slot = 0usize;
-            while used.contains(&slot) {
-                slot += 1;
-            }
+            let Some(slot) = next_free_slot(entry, hotkeys.len()) else {
+                outcome = Some(Err("all pin hotkeys are in use".into()));
+                return;
+            };
             entry.insert(name_owned.clone(), slot);
-            let hotkey = hotkeys
-                .get(slot)
-                .map(|c| format!("[{}]", c))
-                .unwrap_or_else(|| format!("slot {}", slot + 1));
-            outcome = Some(format!("pinned {} → {}", hotkey, name_owned));
+            let label = format_slot(&hotkeys, slot);
+            outcome = Some(Ok(format!("pinned {} → {}", label, name_owned)));
         });
-        outcome
+        match outcome {
+            Some(Ok(msg)) => Some(msg),
+            Some(Err(e)) => {
+                self.set_error(e);
+                None
+            }
+            None => None,
+        }
     }
 
-    /// Pin the focused tab if it isn't pinned yet. Idempotent: re-firing on
-    /// an already-pinned tab just reports the existing slot rather than
-    /// unpinning. Used by the `pin-current` pipe where the user's intent is
-    /// "make sure this is pinned", not "toggle".
+    /// Pin the focused tab if it isn't pinned yet. Truly idempotent: the
+    /// read-modify-write inside `mutate_state` re-checks pinned state after
+    /// reloading from disk, so a stale in-memory snapshot can't cause a
+    /// pin → unpin flip via `toggle_pin`. Used by the `pin-current` pipe.
     fn pin_current_only(&mut self) -> Option<String> {
         let Some(name) = self.current_tab_name.clone() else {
             self.set_error("no focused tab".into());
             return None;
         };
-        if let Some(slot) = self.slot_for_tab(&name) {
-            let hotkey = self
-                .hotkey_for_slot(slot)
-                .map(|c| format!("[{}]", c))
-                .unwrap_or_else(|| format!("slot {}", slot + 1));
-            return Some(format!("already pinned {} → {}", hotkey, name));
+        let Some(session) = self.current_session.clone() else {
+            self.set_error("no current session".into());
+            return None;
+        };
+        let hotkeys = self.hotkeys.clone();
+        let mut outcome: Option<Result<String, String>> = None;
+        self.mutate_state(|s| {
+            let entry = s.pinned.entry(session).or_default();
+            if let Some(&slot) = entry.get(&name) {
+                outcome = Some(Ok(format!(
+                    "already pinned {} → {}",
+                    format_slot(&hotkeys, slot),
+                    name
+                )));
+                return;
+            }
+            let Some(slot) = next_free_slot(entry, hotkeys.len()) else {
+                outcome = Some(Err("all pin hotkeys are in use".into()));
+                return;
+            };
+            entry.insert(name.clone(), slot);
+            outcome = Some(Ok(format!(
+                "pinned {} → {}",
+                format_slot(&hotkeys, slot),
+                name
+            )));
+        });
+        match outcome {
+            Some(Ok(msg)) => Some(msg),
+            Some(Err(e)) => {
+                self.set_error(e);
+                None
+            }
+            None => None,
         }
-        self.toggle_pin(&name)
     }
 
     /// Consume a pending `pin-current` pipe message only once we know both
@@ -417,22 +457,49 @@ impl State {
 /// platforms; the WASM plugin can't `cfg!(target_os = …)` because it's
 /// compiled once for `wasm32-wasip1` regardless of host.
 ///
+/// The message is passed as a positional shell parameter (`$1`) so tab
+/// names containing quotes or backslashes can't break the inner command.
+///
 /// On hosts with neither command, the notification is silently dropped. The
 /// pin itself still succeeds — only the toast is missing.
 ///
 /// Notifications are off by default. Opt in with the plugin config option
 /// `notifications = "on"` (or `true` / `1` / `yes`).
 fn notify_user(msg: &str) {
-    let safe = msg.replace(['"', '\\'], "");
-    let shell_cmd = format!(
-        "if command -v osascript >/dev/null 2>&1; then \
-            osascript -e 'display notification \"{m}\" with title \"tab-jump\"'; \
-         elif command -v notify-send >/dev/null 2>&1; then \
-            notify-send 'tab-jump' '{m}'; \
-         fi",
-        m = safe,
+    let script = r#"if command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"$1\" with title \"tab-jump\""
+elif command -v notify-send >/dev/null 2>&1; then
+    notify-send 'tab-jump' "$1"
+fi"#;
+    run_command(
+        &["sh", "-c", script, "sh", msg],
+        BTreeMap::new(),
     );
-    run_command(&["sh", "-c", &shell_cmd], BTreeMap::new());
+}
+
+/// Lowest free slot index strictly less than `max_slots`.
+fn next_free_slot(pins: &BTreeMap<String, usize>, max_slots: usize) -> Option<usize> {
+    let used: BTreeSet<usize> = pins.values().copied().collect();
+    (0..max_slots).find(|s| !used.contains(s))
+}
+
+/// Render a slot as either its hotkey (`[f]`) or numeric fallback (`slot 3`).
+fn format_slot(hotkeys: &[char], slot: usize) -> String {
+    hotkeys
+        .get(slot)
+        .map(|c| format!("[{}]", c))
+        .unwrap_or_else(|| format!("slot {}", slot + 1))
+}
+
+/// Strip whitespace and duplicate characters from a hotkey config string,
+/// preserving the order of first occurrence. Duplicate hotkeys would create
+/// unreachable slots, so we silently drop them.
+fn dedupe_hotkeys(raw: &str) -> Vec<char> {
+    let mut seen = BTreeSet::new();
+    raw.chars()
+        .filter(|c| !c.is_whitespace())
+        .filter(|c| seen.insert(*c))
+        .collect()
 }
 
 // ─── view helpers ─────────────────────────────────────────────────────────
@@ -441,17 +508,20 @@ impl State {
     /// All tabs in display order: pinned first (sorted by slot), then unpinned
     /// (in tab position order).
     fn visible_tabs(&self) -> Vec<&TabInfo> {
+        let pins = self.session_pins();
         let mut pinned: Vec<&TabInfo> = Vec::new();
         let mut unpinned: Vec<&TabInfo> = Vec::new();
-        let by_slot = self.session_pins().cloned().unwrap_or_default();
         for t in &self.tabs {
-            if by_slot.contains_key(&t.name) {
+            if pins.is_some_and(|p| p.contains_key(&t.name)) {
                 pinned.push(t);
             } else {
                 unpinned.push(t);
             }
         }
-        pinned.sort_by_key(|t| by_slot.get(&t.name).copied().unwrap_or(usize::MAX));
+        pinned.sort_by_key(|t| {
+            pins.and_then(|p| p.get(&t.name).copied())
+                .unwrap_or(usize::MAX)
+        });
         unpinned.sort_by_key(|t| t.position);
         pinned.extend(unpinned);
         pinned
@@ -487,7 +557,6 @@ impl State {
         }
         let new = (self.selected_index as i32 + delta).rem_euclid(len);
         self.selected_index = new as usize;
-        self.record_selection();
     }
 
     /// Restore `selected_index` to the previous-focused tab so `Enter`
@@ -535,7 +604,6 @@ impl State {
 
     fn set_error(&mut self, msg: String) {
         self.error = Some(msg);
-        self.error_ticks_remaining = ERROR_DECAY_TICKS;
     }
 }
 
@@ -597,8 +665,10 @@ impl State {
             BareKey::Char(c) => {
                 if let Some(slot) = self.slot_for_hotkey(c) {
                     self.jump_to_slot(slot, c);
+                    true
+                } else {
+                    false
                 }
-                true
             }
             _ => false,
         }
@@ -661,6 +731,17 @@ impl State {
         if self.current_tab_name.as_deref() == Some(name) {
             hide_self();
             return;
+        }
+        // Record the focus change synchronously: zellij doesn't deliver
+        // TabUpdate to hidden panes, so relying on `absorb_tabs` to capture
+        // the previous tab would miss the case where the picker hides
+        // immediately after jumping.
+        if let (Some(session), Some(old)) =
+            (self.current_session.clone(), self.current_tab_name.clone())
+        {
+            self.mutate_state(|s| {
+                s.previous_tab.insert(session, old);
+            });
         }
         go_to_tab_name(name);
         self.pending_close = true;
@@ -726,11 +807,18 @@ impl State {
         self.clamp_selection();
         let mut lines: Vec<String> = Vec::with_capacity(rows);
 
+        let visible = self.filtered_tabs();
+        // Show pinned tabs that are actually present in the current tab
+        // list; stale pins for renamed/closed tabs aren't counted.
+        let live_pin_count = visible
+            .iter()
+            .filter(|t| self.slot_for_tab(&t.name).is_some())
+            .count();
+
         let session = self.current_session.as_deref().unwrap_or("<no session>");
-        let pin_count = self.session_pins().map(|p| p.len()).unwrap_or(0);
         let tab_count = self.tabs.len();
         lines.push(format!(
-            " {CSI}1;36mTabs ({tab_count}){CSI}0m  {CSI}90m· {pin_count} pinned  · session: {CSI}33m{session}{CSI}0m"
+            " {CSI}1;36mTabs ({tab_count}){CSI}0m  {CSI}90m· {live_pin_count} pinned  · session: {CSI}33m{session}{CSI}0m"
         ));
 
         if let Some(toast) = self.pin_toast.as_deref() {
@@ -747,7 +835,6 @@ impl State {
         lines.push(prompt);
         lines.push(String::new());
 
-        let visible = self.filtered_tabs();
         if visible.is_empty() {
             lines.push(format!(" {CSI}90m(no tabs){CSI}0m"));
         }
@@ -756,12 +843,11 @@ impl State {
             .as_ref()
             .and_then(|s| self.persisted.previous_tab.get(s).cloned());
         let mut separator_shown = false;
-        let pin_total = self.session_pins().map(|p| p.len()).unwrap_or(0);
         for (i, t) in visible.iter().enumerate() {
             let slot = self.slot_for_tab(&t.name);
             let is_pinned = slot.is_some();
 
-            if !is_pinned && !separator_shown && pin_total > 0 && i > 0 {
+            if !is_pinned && !separator_shown && live_pin_count > 0 && i > 0 {
                 lines.push(format!(" {CSI}90m─── unpinned ───{CSI}0m"));
                 separator_shown = true;
             }
@@ -804,21 +890,25 @@ impl State {
             .as_deref()
             .map(|e| format!("{CSI}1;31m {e}{CSI}0m"));
 
-        let reserved = 1 + if error_line.is_some() { 1 } else { 0 };
-        if rows > reserved {
-            let max_content = rows - reserved;
-            if lines.len() > max_content {
-                lines.truncate(max_content);
-            } else {
-                while lines.len() < max_content {
-                    lines.push(String::new());
-                }
+        // Reserve the footer row (always) and the error row (when present),
+        // but only if we have the rows to spare. Saturating math keeps tiny
+        // pane sizes from producing negative `max_content`.
+        let footer_reserved = usize::from(rows > 0);
+        let error_reserved =
+            usize::from(error_line.is_some() && rows > footer_reserved);
+        let max_content = rows.saturating_sub(footer_reserved + error_reserved);
+        lines.truncate(max_content);
+        while lines.len() < max_content {
+            lines.push(String::new());
+        }
+        if error_reserved == 1 {
+            if let Some(e) = error_line {
+                lines.push(e);
             }
         }
-        if let Some(e) = error_line {
-            lines.push(e);
+        if footer_reserved == 1 {
+            lines.push(footer_line);
         }
-        lines.push(footer_line);
 
         let _ = cols;
         let mut out = std::io::stdout().lock();

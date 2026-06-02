@@ -19,13 +19,19 @@ few tabs to `f` / `d` / `s` / `a`, and jump with one keystroke.
   confirms the assigned slot.
 - **`Tab`** in the picker toggles to the previously-focused tab.
 - **`/`** fuzzy-search filter across all tabs.
-- **Persistent** across zellij restarts — state is keyed by session name,
-  shared across plugin instances via a single state file with
-  read-modify-write semantics.
+- **Persistent** across zellij restarts. State lives in
+  `/tmp/zellij-tab-jump-state.json` (which on macOS resolves to the
+  per-user `$TMPDIR`), keyed by session name, shared across plugin
+  instances via read-modify-write with atomic temp-and-rename writes.
 
 ## Install
 
+Prerequisites: Rust toolchain with the `wasm32-wasip1` target installed
+(`rustup target add wasm32-wasip1`).
+
 ```sh
+git clone https://github.com/vxio/zellij-tab-jump
+cd zellij-tab-jump
 cargo build --release
 mkdir -p ~/.config/zellij/plugins
 cp target/wasm32-wasip1/release/zellij-tab-jump.wasm \
@@ -41,28 +47,25 @@ The plugin exposes two **pipe message names** — `toggle` and
 | Pipe message | What it does |
 |---|---|
 | `toggle` | Show the picker if hidden, hide it if visible. Pair with `LaunchOrFocusPlugin` so the same key both opens and closes. |
-| `pin-current` | Pin the currently focused tab and fire a desktop notification. Idempotent — never unpins. |
+| `pin-current` | Pin the currently focused tab. Idempotent — re-firing on an already-pinned tab is a no-op. Optionally fires a desktop notification (off by default; see [Notifications](#notifications)). |
 
 Drop this block into `config.kdl` and swap the `bind` keys to taste
 (e.g. `Ctrl t` / `Ctrl Shift t`, `Alt o` / `Alt Shift o`, …):
 
 ```kdl
 shared_except "locked" {
-    // === Open / toggle the picker. Change "Alt d" to any key. ===
+    // Open / toggle the picker. Change "Alt d" to any key.
     bind "Alt d" {
         LaunchOrFocusPlugin "file:~/.config/zellij/plugins/tab-jump.wasm" {
             floating true
             move_to_focused_tab true
-            // Optional plugin config:
-            // hotkeys "fdsajkl;"
-            // notifications "on"
         }
         MessagePlugin "file:~/.config/zellij/plugins/tab-jump.wasm" {
             name "toggle"
         }
     }
 
-    // === Quick-pin the focused tab. Change "Alt D" to any key. ===
+    // Quick-pin the focused tab. Change "Alt D" to any key.
     bind "Alt D" {
         MessagePlugin "file:~/.config/zellij/plugins/tab-jump.wasm" {
             name "pin-current"
@@ -71,15 +74,17 @@ shared_except "locked" {
 }
 
 // Preload so the quick-pin binding always reaches an instance — the
-// picker stays suppressed until the toggle key opens it.
+// picker stays suppressed until the toggle key opens it. Plugin config
+// (hotkeys, notifications) goes here; see Configuration below.
 load_plugins {
     "file:~/.config/zellij/plugins/tab-jump.wasm"
 }
 ```
 
-Required permissions: `ReadApplicationState`, `ChangeApplicationState`,
-`RunCommands` (for the notification shell-out). The plugin requests them
-on first load.
+Required permissions: `ReadApplicationState` and `ChangeApplicationState`
+(always); `RunCommands` is requested only when `notifications = "on"`
+since it's exclusively used for the notifier shell-out. The plugin
+requests permissions on first load and zellij prompts once.
 
 The rest of the docs use **toggle key** and **quick-pin key** to mean
 "whatever you bound to the `toggle` and `pin-current` pipe messages."
@@ -88,7 +93,7 @@ The rest of the docs use **toggle key** and **quick-pin key** to mean
 
 | Key | Action |
 |---|---|
-| `f` `d` `s` `a` `j` `k` `l` `;` | jump to the pinned slot |
+| configured hotkey letter (default `f` `d` `s` `a` `j` `k` `l` `;`) | jump to the pinned slot |
 | `Tab` | toggle to the previously-focused tab |
 | `↑` / `↓` + `Enter` | jump to highlighted tab |
 | `/` | start fuzzy search; type to filter |
@@ -115,8 +120,9 @@ the visual confirmation.
 
 ## Configuration
 
-Pass plugin config inside the `LaunchOrFocusPlugin` block and on
-`load_plugins`:
+Plugin config goes inside the `load_plugins` block. Any args set here
+apply to the preloaded background instance, which the toggle and
+quick-pin bindings reuse — so this is the single source of truth.
 
 ```kdl
 load_plugins {
@@ -129,16 +135,15 @@ load_plugins {
 
 | key | default | description |
 |---|---|---|
-| `hotkeys` | `fdsajkl;` | Ordered list of single-char slot letters. Whitespace ignored. Tabs beyond `len(hotkeys)` can still be reached via arrows or search, just without a single-letter shortcut. |
+| `hotkeys` | `fdsajkl;` | Ordered list of single-char slot letters. Whitespace and duplicate characters are stripped. The number of pin slots equals `len(hotkeys)`; attempting to pin past that fails with an error in the picker. Unpinned tabs are always reachable via arrows or search. |
 | `notifications` | `off` | Set to `on` (or `true` / `1` / `yes`) to enable the quick-pin desktop notification. Any other value (or omitting) leaves it off. |
 
 ### How many pins can I have?
 
-Whatever fits in `hotkeys`. There's no internal cap — pin count is just
-`len(hotkeys)`. The default is 8 because eight home-row letters are the
-sweet spot for muscle memory, but you can scale up to ~20+ with the top
-and bottom rows. Any printable character works except those reserved by
-the picker (`g` = pin, `/` = search, `Space`, `Tab`, `Enter`, `Esc`,
+`len(hotkeys)`. The default is 8 — the home row is the sweet spot for
+muscle memory — but you can scale up to ~20 by adding top- and
+bottom-row letters. Any printable character works except those reserved
+by the picker (`g` = pin, `/` = search, `Space`, `Tab`, `Enter`, `Esc`,
 arrows, `Ctrl-c`).
 
 A ~16-slot home + top-row config:
@@ -175,10 +180,19 @@ Two binding paths share one preloaded plugin instance:
                                             ╰──────────────────╯
 ```
 
-State lives in a single JSON file (`/tmp/zellij-tab-jump-state.json`),
-shared by every running plugin instance for that session. Each mutation
-re-reads the file, applies the change, and writes it back — so the
-preloaded background instance and the visible picker can't race.
+State lives in `/tmp/zellij-tab-jump-state.json`, shared by every
+running plugin instance. Each mutation re-reads the file, applies the
+change, and writes it back via a temp + rename so a crash mid-write
+can't leave a truncated file.
+
+The path is deliberately under `/tmp`: zellij's wasi sandbox only
+exposes `/tmp` as writable, so XDG paths under `$HOME` aren't reachable
+from the plugin. macOS resolves `/tmp` to the per-user
+`$TMPDIR` (e.g. `/private/var/folders/<hash>/T/zellij-<uid>/`), so the
+file is already user-isolated there. On Linux it sits in the shared
+host `/tmp`; per-session keying inside the JSON keeps concurrent zellij
+sessions from clashing, but two users running this plugin on the same
+machine would share one file.
 
 The quick-pin key is wired as a `MessagePlugin` pipe (not
 `LaunchOrFocusPlugin`) so the picker never pops; the preloaded instance
@@ -208,8 +222,10 @@ target in `.cargo/config.toml` defaults to `wasm32-wasip1` so a plain
 - **Pinning is manual**, not auto-assigned. The expected workflow: pin
   your 2–3 active tabs once; everything else stays unpinned and
   reachable via arrows/search.
-- **State path**: `/tmp/zellij-tab-jump-state.json`, keyed by session name.
-  Multiple concurrent zellij sessions don't trample each other.
+- **State path**: `/tmp/zellij-tab-jump-state.json` (per-user on macOS
+  via `$TMPDIR`; shared on Linux). Keyed by session name so multiple
+  concurrent zellij sessions don't trample each other. See
+  [How it works](#how-it-works) for why `/tmp` instead of XDG.
 - **Pins are sticky**: renaming or moving a tab does NOT auto-prune the
   pin. The `TabUpdate` / `get_session_list` tab names don't always match
   the user-facing display names (tab-bar prefixes like `"1) "` aren't
