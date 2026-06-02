@@ -14,9 +14,10 @@
 //!   (default `fdsajkl;`); pressing the letter in the picker jumps there.
 //! * `Tab` in the picker toggles to the previously-focused tab.
 //! * `/` starts a fuzzy search over tab names; arrows + Enter jump.
-//! * Desktop notification confirms pins made outside the picker
-//!   (`osascript` on macOS, `notify-send` on Linux). Set the
-//!   `notifications = "off"` plugin config to suppress.
+//! * Desktop notification confirms pins made outside the picker, when
+//!   opted in with `notifications = "on"`. Off by default. Backed by
+//!   `osascript` on macOS and `notify-send` on Linux; silent no-op on
+//!   hosts with neither.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -69,8 +70,9 @@ struct State {
 
     persisted: PersistedState,
     hotkeys: Vec<char>,
-    /// When false, the `pin-current` pipe skips the desktop notification
-    /// call. Configured via the `notifications` plugin arg in `config.kdl`.
+    /// When false (the default), the `pin-current` pipe skips the desktop
+    /// notification call. Enabled by setting the plugin arg
+    /// `notifications = "on"` in `config.kdl`.
     notifications_enabled: bool,
 
     mode: Mode,
@@ -119,8 +121,8 @@ impl ZellijPlugin for State {
 
         self.notifications_enabled = cfg
             .get("notifications")
-            .map(|v| !matches!(v.as_str(), "off" | "false" | "0" | "no"))
-            .unwrap_or(true);
+            .map(|v| matches!(v.as_str(), "on" | "true" | "1" | "yes"))
+            .unwrap_or(false);
 
         request_permission(&[
             PermissionType::ReadApplicationState,
@@ -418,9 +420,8 @@ impl State {
 /// On hosts with neither command, the notification is silently dropped. The
 /// pin itself still succeeds — only the toast is missing.
 ///
-/// Notifications can be suppressed entirely by setting the plugin config
-/// option `notifications = "off"`; in that case [`pin_current_and_notify`]
-/// is the only caller that would emit one anyway.
+/// Notifications are off by default. Opt in with the plugin config option
+/// `notifications = "on"` (or `true` / `1` / `yes`).
 fn notify_user(msg: &str) {
     let safe = msg.replace(['"', '\\'], "");
     let shell_cmd = format!(

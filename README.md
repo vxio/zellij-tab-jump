@@ -13,9 +13,10 @@ few tabs to `f` / `d` / `s` / `a`, and jump with one keystroke.
   and unpinned tabs below.
 - **Toggle**: one key opens the picker; pressing it again hides it.
 - **Quick-pin from anywhere**: a second key pins the focused tab without
-  opening the picker. A desktop notification (macOS `osascript` /
-  Linux `notify-send`) confirms the assigned slot. Idempotent — re-firing
-  on an already-pinned tab just reconfirms the slot, never toggles off.
+  opening the picker. Idempotent — re-firing on an already-pinned tab
+  just reconfirms the slot, never toggles off. Optional desktop
+  notification (off by default; macOS `osascript` / Linux `notify-send`)
+  confirms the assigned slot.
 - **`Tab`** in the picker toggles to the previously-focused tab.
 - **`/`** fuzzy-search filter across all tabs.
 - **Persistent** across zellij restarts — state is keyed by session name,
@@ -96,17 +97,21 @@ The rest of the docs use **toggle key** and **quick-pin key** to mean
 
 ## Notifications
 
-The quick-pin key emits a desktop notification confirming the slot
-(e.g. `tab-jump: pinned [f] → 3) zed@main`). The plugin probes for
-`osascript` (macOS) first and falls back to `notify-send` (Linux); on
-hosts with neither, the pin still succeeds but no toast appears.
+**Off by default.** Opt in with `notifications = "on"` in the plugin
+config (see below) to get a desktop toast on every quick-pin
+(e.g. `tab-jump: pinned [f] → 3) zed@main`).
 
-On macOS, banner duration is owned by the OS — set Script Editor's
-notification style to **Banners** under System Settings → Notifications
-to get auto-dismissal.
+When enabled, the plugin probes the host for a notifier and uses
+whichever it finds:
 
-To suppress notifications entirely, set the `notifications` config arg
-(see below).
+| Host | Tool used | Notes |
+|---|---|---|
+| macOS | `osascript` | Ships with the OS. Banner duration is OS-controlled — set Script Editor's notification style to **Banners** in System Settings → Notifications for auto-dismiss. |
+| Linux | `notify-send` | Provided by `libnotify` on most desktop distros. Install via your package manager if missing (e.g. `apt install libnotify-bin`). |
+| Other / neither installed | — | Pin still succeeds; the toast is silently dropped. |
+
+Either way, the pin itself always happens — the notification is just
+the visual confirmation.
 
 ## Configuration
 
@@ -117,7 +122,7 @@ Pass plugin config inside the `LaunchOrFocusPlugin` block and on
 load_plugins {
     "file:~/.config/zellij/plugins/tab-jump.wasm" {
         hotkeys "fdsajkl;"
-        notifications "on"
+        notifications "off"
     }
 }
 ```
@@ -125,7 +130,7 @@ load_plugins {
 | key | default | description |
 |---|---|---|
 | `hotkeys` | `fdsajkl;` | Ordered list of single-char slot letters. Whitespace ignored. Tabs beyond `len(hotkeys)` can still be reached via arrows or search, just without a single-letter shortcut. |
-| `notifications` | `on` | Set to `off` (or `false` / `0` / `no`) to suppress the quick-pin desktop notification. The pin itself still happens. |
+| `notifications` | `off` | Set to `on` (or `true` / `1` / `yes`) to enable the quick-pin desktop notification. Any other value (or omitting) leaves it off. |
 
 ### How many pins can I have?
 
