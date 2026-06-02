@@ -1,6 +1,7 @@
 # zellij-tab-jump
 
-Pin-and-jump for [Zellij](https://zellij.dev) tabs.
+Pin-and-jump for [Zellij](https://zellij.dev) tabs. Built against the
+`zellij-tile` 0.44 API.
 
 Pin tabs to any keys. For example, bind the picker to `Alt-d`, pin a
 few tabs to `f` / `d` / `s` / `a`, and jump with one keystroke.
@@ -21,12 +22,12 @@ few tabs to `f` / `d` / `s` / `a`, and jump with one keystroke.
 - **`/`** fuzzy-search filter across all tabs.
 - **Persistent** across zellij restarts. State lives in
   `/tmp/zellij-tab-jump-state.json` (which on macOS resolves to the
-  per-user `$TMPDIR`), keyed by session name, shared across plugin
-  instances via read-modify-write with atomic temp-and-rename writes.
+  per-user `$TMPDIR`), keyed by session name, with atomic
+  temp-and-rename writes that survive crashes and concurrent instances.
 
 ## Install
 
-### Option 1 — Zellij URL loading (recommended)
+### Option 1 — Zellij URL loading
 
 Zellij can fetch a remote `.wasm` and cache it. No Rust toolchain
 needed; nothing to download manually. Reference the release URL
@@ -50,9 +51,10 @@ load_plugins {
 }
 ```
 
-Zellij downloads the wasm on first run and caches it under
-`~/.cache/zellij/plugins/`. Updates are pulled when you bump the URL
-to a pinned tag (e.g. `…/download/v0.2.0/tab-jump.wasm`).
+Zellij downloads the wasm on first run and caches it indefinitely
+under `~/.cache/zellij/plugins/` keyed by URL. **The `latest/download`
+URL does not auto-refresh** — Zellij sees the same URL and reuses the
+cache. See [Updating](#updating) for how to refresh.
 
 ### Option 2 — Download prebuilt wasm
 
@@ -83,6 +85,33 @@ mkdir -p ~/.config/zellij/plugins
 cp target/wasm32-wasip1/release/zellij-tab-jump.wasm \
    ~/.config/zellij/plugins/tab-jump.wasm
 ```
+
+## Updating
+
+Zellij has no built-in plugin update mechanism. Pick whichever fits
+your install style:
+
+**For Options 1 and 2** — re-fetch the latest release and clear
+Zellij's URL cache (or replace the file in `~/.config/zellij/plugins/`),
+then hot-reload running pickers:
+
+```sh
+curl -L https://github.com/vxio/zellij-tab-jump/releases/latest/download/tab-jump.wasm \
+  -o ~/.config/zellij/plugins/tab-jump.wasm
+zellij action start-or-reload-plugin file:~/.config/zellij/plugins/tab-jump.wasm
+```
+
+For URL-loaded installs (Option 1), also clear the cached download:
+
+```sh
+rm -rf ~/.cache/zellij/plugins
+```
+
+**For Option 3 (source)** — `git pull && cargo build --release` and
+re-copy the wasm.
+
+To pin a specific version instead of `latest`, swap the URL for a
+tagged release: `…/releases/download/v0.2.0/tab-jump.wasm`.
 
 ## Keybindings
 
@@ -204,32 +233,27 @@ load_plugins {
 
 ## How it works
 
-Two binding paths share one preloaded plugin instance:
+`load_plugins` preloads a single plugin instance at startup. Both
+bindings target *that* instance via pipe messages, so there's only
+ever one process holding state:
 
 ```diagram
-╭─────────────────╮   LaunchOrFocusPlugin   ╭──────────────────╮
-│ toggle key      │ ──────────────────────▶ │ floating picker  │
-│                 │   MessagePlugin toggle  │ (per-press show/ │
-│                 │ ──────────────────────▶ │  hide)           │
-╰─────────────────╯                         ╰────────┬─────────╯
-                                                     │ g / hotkey
-                                                     ▼
-╭─────────────────╮   MessagePlugin         ╭──────────────────╮
-│ quick-pin key   │ ──────────────────────▶ │ preloaded bg     │
-│                 │      pin-current        │ instance         │
-╰─────────────────╯                         ╰────────┬─────────╯
-                                                     │ run_command
-                                                     ▼
-                                            ╭──────────────────╮
-                                            │ osascript /      │
-                                            │ notify-send      │
-                                            ╰──────────────────╯
+╭───────────────╮  pipe "toggle"      ╭──────────────────╮     ╭──────────────╮
+│ toggle key    │ ──────────────────▶ │                  │ ──▶ │ state.json   │
+╰───────────────╯                     │  tab-jump        │     ╰──────────────╯
+                                      │  (one preloaded  │
+╭───────────────╮  pipe "pin-current" │   instance)      │     ╭──────────────╮
+│ quick-pin key │ ──────────────────▶ │                  │ ──▶ │ osascript /  │
+╰───────────────╯                     ╰──────────────────╯     │ notify-send  │
+                                                               │ (optional)   │
+                                                               ╰──────────────╯
 ```
 
-State lives in `/tmp/zellij-tab-jump-state.json`, shared by every
-running plugin instance. Each mutation re-reads the file, applies the
-change, and writes it back via a temp + rename so a crash mid-write
-can't leave a truncated file.
+State lives in `/tmp/zellij-tab-jump-state.json`. Every mutation
+re-reads the file, applies the change, and writes it back via a temp +
+rename, so a crash mid-write can't leave a truncated file and any
+sibling plugin instance (e.g. from a stray `LaunchPlugin`) can't
+overwrite recent pins.
 
 The path is deliberately under `/tmp`: zellij's wasi sandbox only
 exposes `/tmp` as writable, so XDG paths under `$HOME` aren't reachable
@@ -241,8 +265,8 @@ sessions from clashing, but two users running this plugin on the same
 machine would share one file.
 
 The quick-pin key is wired as a `MessagePlugin` pipe (not
-`LaunchOrFocusPlugin`) so the picker never pops; the preloaded instance
-handles it silently and triggers the host notifier.
+`LaunchOrFocusPlugin`) so the picker never pops; the preloaded
+instance handles it silently and triggers the host notifier.
 
 ## Development
 
@@ -283,4 +307,4 @@ target in `.cargo/config.toml` defaults to `wasm32-wasip1` so a plain
 
 ## License
 
-MIT
+MIT — see [LICENSE](./LICENSE).
