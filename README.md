@@ -1,5 +1,9 @@
 # zellij-tab-jump
 
+[![CI](https://github.com/vxio/zellij-tab-jump/actions/workflows/ci.yml/badge.svg)](https://github.com/vxio/zellij-tab-jump/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/vxio/zellij-tab-jump?display_name=tag&sort=semver)](https://github.com/vxio/zellij-tab-jump/releases/latest)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 Pin-and-jump for [Zellij](https://zellij.dev) tabs. Built against the
 `zellij-tile` 0.44 API.
 

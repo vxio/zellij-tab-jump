@@ -268,7 +268,9 @@ impl State {
     /// to a hidden plugin pane — without this refresh, `current_tab_name`
     /// can be stale when a `pin-current` pipe fires.
     fn refresh_from_server(&mut self) {
-        let Ok(snapshot) = get_session_list() else { return };
+        let Ok(snapshot) = get_session_list() else {
+            return;
+        };
         let Some(current) = snapshot
             .live_sessions
             .into_iter()
@@ -444,7 +446,9 @@ impl State {
     /// Inside the picker, `g` uses the in-pane toast instead — this path is
     /// for the `pin-current` pipe where we don't want to pop the picker.
     fn pin_current_and_notify(&mut self) {
-        let Some(msg) = self.pin_current_only() else { return };
+        let Some(msg) = self.pin_current_only() else {
+            return;
+        };
         if self.notifications_enabled {
             notify_user(&msg);
         }
@@ -471,10 +475,7 @@ fn notify_user(msg: &str) {
 elif command -v notify-send >/dev/null 2>&1; then
     notify-send 'tab-jump' "$1"
 fi"#;
-    run_command(
-        &["sh", "-c", script, "sh", msg],
-        BTreeMap::new(),
-    );
+    run_command(&["sh", "-c", script, "sh", msg], BTreeMap::new());
 }
 
 /// Lowest free slot index strictly less than `max_slots`.
@@ -826,10 +827,7 @@ impl State {
         }
 
         let prompt = match self.mode {
-            Mode::Search => format!(
-                " {CSI}36m/{CSI}0m{}{CSI}5m_{CSI}0m",
-                self.search_term
-            ),
+            Mode::Search => format!(" {CSI}36m/{CSI}0m{}{CSI}5m_{CSI}0m", self.search_term),
             Mode::Normal => String::new(),
         };
         lines.push(prompt);
@@ -868,7 +866,11 @@ impl State {
             } else {
                 String::new()
             };
-            let name = if t.name.is_empty() { "(unnamed)" } else { t.name.as_str() };
+            let name = if t.name.is_empty() {
+                "(unnamed)"
+            } else {
+                t.name.as_str()
+            };
 
             let line = if is_selected {
                 format!(
@@ -894,8 +896,7 @@ impl State {
         // but only if we have the rows to spare. Saturating math keeps tiny
         // pane sizes from producing negative `max_content`.
         let footer_reserved = usize::from(rows > 0);
-        let error_reserved =
-            usize::from(error_line.is_some() && rows > footer_reserved);
+        let error_reserved = usize::from(error_line.is_some() && rows > footer_reserved);
         let max_content = rows.saturating_sub(footer_reserved + error_reserved);
         lines.truncate(max_content);
         while lines.len() < max_content {
