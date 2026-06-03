@@ -56,10 +56,6 @@ struct PersistedState {
     /// one. Used by `<Tab>` to toggle between two tabs.
     #[serde(default)]
     previous_tab: BTreeMap<String, String>,
-    /// session name → the tab name that was highlighted when the picker
-    /// last closed. Restored when the picker reopens.
-    #[serde(default)]
-    last_selected: BTreeMap<String, String>,
     /// session name → MRU list of tab names, most-recent first. Updated
     /// on every focus change; capped at `MAX_RECENT`. The currently
     /// focused tab is *not* in the list — only previously-focused tabs,
@@ -120,6 +116,25 @@ struct State {
     /// One-line banner shown at the top of the picker after the user pins
     /// a tab with `g` from inside the picker. Cleared on Timer expiry.
     pin_toast: Option<String>,
+
+    /// Our own pane id, captured at Load via `get_plugin_ids()`. Used to
+    /// skip ourselves when temporarily hiding other floating panes so the
+    /// picker pops alone instead of dragging the rest of the floating
+    /// layer onto the screen.
+    own_pane_id: Option<PaneId>,
+    /// Latest `PaneManifest` snapshot. Re-used on `Visible(true)` to find
+    /// floating panes we need to suppress while the picker is up.
+    latest_panes: Option<PaneManifest>,
+    /// Floating panes we hid on the most recent `Visible(true)`. Restored
+    /// on `dismiss()` so the user's floating layer returns to the state
+    /// it was in before the picker opened.
+    hidden_for_picker: Vec<PaneId>,
+    /// Set on `Visible(true)`; cleared once we've successfully hidden the
+    /// other floats. The picker pane is freshly launched on each toggle,
+    /// so `Visible(true)` usually fires before the first `PaneUpdate`
+    /// containing our own pane id — we re-attempt on every manifest
+    /// update until the hide goes through.
+    pending_hide_others: bool,
 }
 
 register_plugin!(State);
@@ -162,18 +177,39 @@ impl ZellijPlugin for State {
         subscribe(&[
             EventType::TabUpdate,
             EventType::SessionUpdate,
+            EventType::PaneUpdate,
             EventType::Key,
             EventType::Visible,
             EventType::Timer,
             EventType::PermissionRequestResult,
         ]);
+
+        let ids = get_plugin_ids();
+        self.own_pane_id = Some(PaneId::Plugin(ids.plugin_id));
+
+        // Arm the hide on Load (not Visible) because the picker is freshly
+        // launched on every toggle-key press — Zellij doesn't fire
+        // Visible(true) for a pane that starts visible. The background
+        // instance won't actually hide anything because its own pane is
+        // suppressed/non-floating, which `hide_other_floats` checks before
+        // touching the manifest.
+        self.pending_hide_others = true;
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::TabUpdate(tabs) => {
+                let was_loaded = self.tabs_loaded;
                 self.absorb_tabs(tabs);
                 self.maybe_flush_pending_pin();
+                // First TabUpdate after Load — the picker pane is already
+                // visible by the time we get here, but Zellij doesn't fire
+                // Visible(true) for a freshly-launched floating pane, so we
+                // can't rely on that hook to seed the cursor.
+                if !was_loaded && self.tabs_loaded {
+                    self.reload_state();
+                    self.restore_selection();
+                }
                 true
             }
             Event::SessionUpdate(infos, _) => {
@@ -196,11 +232,19 @@ impl ZellijPlugin for State {
                 self.mode = Mode::Normal;
                 self.search_term.clear();
                 self.restore_selection();
+                self.pending_hide_others = true;
+                self.hide_other_floats();
                 true
+            }
+            Event::PaneUpdate(manifest) => {
+                self.latest_panes = Some(manifest);
+                if self.pending_hide_others {
+                    self.hide_other_floats();
+                }
+                false
             }
             Event::Visible(false) => {
                 self.is_visible = false;
-                self.record_selection();
                 false
             }
             Event::Timer(_) => {
@@ -705,47 +749,33 @@ impl State {
         self.selected_index = new as usize;
     }
 
-    /// Restore `selected_index` to the previous-focused tab so `Enter`
-    /// double-taps as a tab toggle. Falls back to the last highlighted tab,
-    /// then to the first row.
+    /// Restore `selected_index` to the previously-focused tab — wherever it
+    /// sits in the list (pinned section or recent). Falls back to the first
+    /// recent-section row, then to the first non-active row. Never lands on
+    /// the currently-active tab.
     fn restore_selection(&mut self) {
         let visible = self.filtered_tabs();
         if visible.is_empty() {
             self.selected_index = 0;
             return;
         }
-        let session = self.current_session.clone();
-        let prev = session
+        let prev = self
+            .current_session
             .as_ref()
             .and_then(|s| self.persisted.previous_tab.get(s).cloned());
-        let last = session
-            .as_ref()
-            .and_then(|s| self.persisted.last_selected.get(s).cloned());
-        for candidate in [prev, last].iter().flatten() {
-            if let Some(idx) = visible.iter().position(|t| &t.name == candidate) {
+        if let Some(name) = prev {
+            if let Some(idx) = visible.iter().position(|t| t.name == name && !t.active) {
                 self.selected_index = idx;
                 return;
             }
         }
-        self.selected_index = 0;
-    }
-
-    fn record_selection(&mut self) {
-        let name = self
-            .filtered_tabs()
-            .get(self.selected_index)
-            .map(|t| t.name.clone());
-        let Some(session) = self.current_session.clone() else {
-            return;
-        };
-        self.mutate_state(|s| match name {
-            Some(n) => {
-                s.last_selected.insert(session, n);
+        if let Some(name) = self.tab_for_recent_slot(0) {
+            if let Some(idx) = visible.iter().position(|t| t.name == name && !t.active) {
+                self.selected_index = idx;
+                return;
             }
-            None => {
-                s.last_selected.remove(&session);
-            }
-        });
+        }
+        self.selected_index = visible.iter().position(|t| !t.active).unwrap_or(0);
     }
 
     fn set_error(&mut self, msg: String) {
@@ -881,12 +911,84 @@ impl State {
     /// last attached to — re-opening via `LaunchOrFocusPlugin` would warp
     /// the user back to that tab even with `move_to_focused_tab true`.
     /// `close_self()` removes the pane outright so the next launch creates
-    /// a fresh one on the user's current tab. We persist selection state
-    /// up front because `Visible(false)` may not fire before the WASM
-    /// instance is torn down.
+    /// a fresh one on the user's current tab.
     fn dismiss(&mut self) {
-        self.record_selection();
+        self.pending_hide_others = false;
+        self.restore_hidden_floats();
         close_self();
+    }
+
+    /// Suppress every other floating pane on the current tab so the picker
+    /// pops alone instead of dragging the user's entire floating layer
+    /// onto the screen. We only touch panes that are currently visible
+    /// (not already suppressed) so we don't accidentally surface the
+    /// preloaded background instance or panes the user had hidden.
+    fn hide_other_floats(&mut self) {
+        if !self.hidden_for_picker.is_empty() {
+            return;
+        }
+        let (Some(own), Some(manifest)) = (self.own_pane_id, self.latest_panes.clone()) else {
+            return;
+        };
+        let Some(active_pos) = self.tabs.iter().find(|t| t.active).map(|t| t.position) else {
+            return;
+        };
+        let Some(panes) = manifest.panes.get(&active_pos) else {
+            return;
+        };
+        let own_plugin_id = match own {
+            PaneId::Plugin(id) => id,
+            _ => return,
+        };
+        let self_entry = manifest
+            .panes
+            .values()
+            .flatten()
+            .find(|p| p.is_plugin && p.id == own_plugin_id);
+        let Some(self_entry) = self_entry else {
+            self.pending_hide_others = false;
+            return;
+        };
+        // Preloaded background instance: suppressed pane, nothing to do.
+        if self_entry.is_suppressed {
+            self.pending_hide_others = false;
+            return;
+        }
+        // Tiled, visible instance — usually spawned by `MessagePlugin
+        // "toggle"` when no existing instance matched its config
+        // fingerprint. Self-destruct so it doesn't crowd the user's
+        // current pane.
+        if !self_entry.is_floating {
+            self.pending_hide_others = false;
+            close_self();
+            return;
+        }
+        for p in panes {
+            if !p.is_floating || p.is_suppressed {
+                continue;
+            }
+            let id = if p.is_plugin {
+                PaneId::Plugin(p.id)
+            } else {
+                PaneId::Terminal(p.id)
+            };
+            if id == own {
+                continue;
+            }
+            hide_pane_with_id(id);
+            self.hidden_for_picker.push(id);
+        }
+        self.pending_hide_others = false;
+    }
+
+    /// Re-surface the floating panes we hid in `hide_other_floats` so the
+    /// user's floating layer returns to its pre-picker state. We pass
+    /// `should_focus_pane = false` so closing the picker leaves focus on
+    /// the embedded pane the user came from, not on a restored float.
+    fn restore_hidden_floats(&mut self) {
+        for id in std::mem::take(&mut self.hidden_for_picker) {
+            show_pane_with_id(id, true, false);
+        }
     }
 
     fn jump_to_tab(&mut self, name: &str) {
