@@ -310,12 +310,11 @@ impl ZellijPlugin for State {
 impl State {
     /// Apply a fresh list of tabs from zellij: update `current_tab_name` and
     /// record the focus change in `previous_tab` if the user moved off a
-    /// known tab. Pins are intentionally *not* auto-pruned here — the live
-    /// tab name reported by `TabUpdate` / `get_session_list` doesn't always
-    /// match the display name we pinned under (e.g. tab-bar prefixes like
-    /// "1) " aren't part of `TabInfo.name`), so name-based pruning would
-    /// wipe valid pins on every focus change. Stale pins linger until the
-    /// user clears them with `g` in the picker.
+    /// known tab. Pins are intentionally *not* auto-pruned here — a pinned
+    /// tab can be momentarily absent from a snapshot, so name-based pruning
+    /// could wipe a valid pin. Stale pins linger until the user clears them
+    /// with `g` in the picker. Pin keys are normalized via `pin_key`, so the
+    /// volatile `N) ` tab-bar prefix no longer orphans a pin on renumber.
     fn absorb_tabs(&mut self, tabs: Vec<TabInfo>) {
         let new_focus = tabs.iter().find(|t| t.active).map(|t| t.name.clone());
         let focus_change = match (self.current_tab_name.as_ref(), new_focus.as_ref()) {
@@ -406,7 +405,7 @@ impl State {
     }
 
     fn slot_for_tab(&self, name: &str) -> Option<usize> {
-        self.session_pins()?.get(name).copied()
+        self.session_pins()?.get(pin_key(name)).copied()
     }
 
     fn hotkey_for_slot(&self, slot: usize) -> Option<char> {
@@ -427,7 +426,7 @@ impl State {
             return None;
         };
         let hotkeys = self.hotkeys.clone();
-        let name_owned = tab_name.to_string();
+        let name_owned = pin_key(tab_name).to_string();
         let mut outcome: Option<Result<String, String>> = None;
         self.mutate_state(|s| {
             let entry = s.pinned.entry(session).or_default();
@@ -458,7 +457,11 @@ impl State {
     /// reloading from disk, so a stale in-memory snapshot can't cause a
     /// pin → unpin flip via `toggle_pin`. Used by the `pin-current` pipe.
     fn pin_current_only(&mut self) -> Option<String> {
-        let Some(name) = self.current_tab_name.clone() else {
+        let Some(name) = self
+            .current_tab_name
+            .as_deref()
+            .map(|n| pin_key(n).to_string())
+        else {
             self.set_error("no focused tab".into());
             return None;
         };
@@ -557,6 +560,21 @@ fn next_free_slot(pins: &BTreeMap<String, usize>, max_slots: usize) -> Option<us
     (0..max_slots).find(|s| !used.contains(s))
 }
 
+/// Strip zellij's volatile `N) ` tab-bar position prefix so pins key on the
+/// stable tab name. The prefix renumbers whenever tabs are added, closed, or
+/// reordered; keying pins on the raw name would orphan the pin on every
+/// renumber and leak its hotkey slot, pushing later pins onto `s`, `k`, …
+/// instead of packing `f`, `d`, `s`, `a`.
+fn pin_key(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    let digits = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 && bytes.get(digits) == Some(&b')') && bytes.get(digits + 1) == Some(&b' ') {
+        &name[digits + 2..]
+    } else {
+        name
+    }
+}
+
 /// Render a slot as either its hotkey (`[f]`) or numeric fallback (`slot 3`).
 fn format_slot(hotkeys: &[char], slot: usize) -> String {
     hotkeys
@@ -627,7 +645,7 @@ impl State {
         let pins = self.session_pins();
         let mut out = Vec::new();
         for name in list {
-            if pins.is_some_and(|p| p.contains_key(name)) {
+            if pins.is_some_and(|p| p.contains_key(pin_key(name))) {
                 continue;
             }
             if let Some(t) = self.tabs.iter().find(|t| &t.name == name) {
@@ -676,12 +694,12 @@ impl State {
         let pins = self.session_pins();
         let mut pinned: Vec<&TabInfo> = Vec::new();
         for t in &self.tabs {
-            if pins.is_some_and(|p| p.contains_key(&t.name)) {
+            if pins.is_some_and(|p| p.contains_key(pin_key(&t.name))) {
                 pinned.push(t);
             }
         }
         pinned.sort_by_key(|t| {
-            pins.and_then(|p| p.get(&t.name).copied())
+            pins.and_then(|p| p.get(pin_key(&t.name)).copied())
                 .unwrap_or(usize::MAX)
         });
 
@@ -691,7 +709,7 @@ impl State {
         let mut never_visited: Vec<&TabInfo> = Vec::new();
         let mut current: Option<&TabInfo> = None;
         for t in &self.tabs {
-            let is_pinned = pins.is_some_and(|p| p.contains_key(&t.name));
+            let is_pinned = pins.is_some_and(|p| p.contains_key(pin_key(&t.name)));
             if is_pinned || in_recent.contains(t.name.as_str()) {
                 continue;
             }
@@ -1022,10 +1040,16 @@ impl State {
     }
 
     fn jump_to_slot(&mut self, slot: usize, hotkey: char) {
-        let target = self
+        let key = self
             .session_pins()
             .and_then(|p| p.iter().find(|(_, &s)| s == slot).map(|(n, _)| n.clone()));
-        match target {
+        let live = key.and_then(|k| {
+            self.tabs
+                .iter()
+                .find(|t| pin_key(&t.name) == k)
+                .map(|t| t.name.clone())
+        });
+        match live {
             Some(name) => self.jump_to_tab(&name),
             None => self.set_error(format!("no tab pinned to '{}'", hotkey)),
         }
